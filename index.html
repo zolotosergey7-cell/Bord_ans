@@ -2670,7 +2670,23 @@ var qrcode = function() {
     txt.oninput = () => { document.getElementById('len').textContent = txt.value.length + ' / ' + MAXLEN; refreshBtn(); };
 
     let clients = null;
-    function flush(){ pending.forEach(p => publishAll(clients, T_CARDS, p.card, 1)); }
+    function markSent(p){
+      if (p.sent) return;
+      p.sent = true;
+      sent.push({ type: p.card.type, text: p.card.text }); store.set(sentKey, sent); renderSent();
+      showToast('ok', '✅ Отправлено! Карточка появится на доске. Можно написать ещё одну.');
+    }
+    function sendOne(p){
+      const data = JSON.stringify(p.card);
+      (clients || []).forEach(c => {
+        if (!c.connected) return;
+        try{
+          c.publish(T_CARDS, data, { qos: 1 }, err => { if (!err) markSent(p); });
+        }catch(e){}
+      });
+      p.lastTry = Date.now();
+    }
+    function flush(){ pending.forEach(sendOne); }
     function refresh(){
       if (liveCount(clients)) setStatus('ok', 'Связь есть');
       else setStatus('err', 'Нет связи, переподключаемся…');
@@ -2679,9 +2695,9 @@ var qrcode = function() {
       c => { c.subscribe(T_ACK, { qos: 0 }); flush(); },
       msg => {
         if (msg && msg.kind === 'ack' && pending.has(msg.id)){
-          const c = pending.get(msg.id).card; pending.delete(msg.id);
-          sent.push({ type: c.type, text: c.text }); store.set(sentKey, sent); renderSent();
-          showToast('ok', '✅ Карточка на доске! Можно отправить ещё одну.');
+          const p = pending.get(msg.id); pending.delete(msg.id);
+          const was = p.sent; markSent(p);
+          if (was) showToast('ok', '✅ Карточка на доске! Можно написать ещё одну.');
         }
       },
       refresh
@@ -2693,20 +2709,30 @@ var qrcode = function() {
       const card = { kind: 'card', id: uid(), type, text: clean(txt.value, MAXLEN), name: clean(nameIn.value, 40) };
       if (!card.text) return;
       store.set('tb_name', card.name);
-      pending.set(card.id, { card, at: Date.now() });
-      flush();
+      const p = { card, at: Date.now(), lastTry: 0, sent: false };
+      pending.set(card.id, p);
+      sendOne(p);
       txt.value = ''; txt.oninput();
       showToast('', liveCount(clients) ? 'Отправляем…' : 'Ждём связь, карточка отправится автоматически…');
     };
 
-    // resend anything unacknowledged; tell the user if the board doesn't answer
+    // Background: quietly resend until the board confirms (max 2 min); revive stuck connections.
+    let lastRevive = 0;
     setInterval(() => {
-      if (!pending.size) return;
-      flush();
-      const oldest = Math.min(...[...pending.values()].map(p => p.at));
-      if (Date.now() - oldest > 10000 && liveCount(clients))
-        showToast('err', 'Доска пока не ответила — возможно, у тренера она закрыта. Карточка отправится, как только доска появится в сети.');
-    }, 4000);
+      const now = Date.now();
+      let stuck = false;
+      pending.forEach((p, id) => {
+        const age = now - p.at;
+        if (p.sent && age > 120000){ pending.delete(id); return; }
+        if (now - p.lastTry > 6000) sendOne(p);
+        if (!p.sent && age > 8000) stuck = true;
+        if (!p.sent && age > 20000) showToast('err', 'Пока не получается отправить. Проверьте интернет — карточка отправится автоматически.');
+      });
+      if (stuck && now - lastRevive > 15000){
+        lastRevive = now;
+        (clients || []).forEach(c => { try{ c.reconnect(); }catch(e){} });
+      }
+    }, 3000);
   }
 })();
 </script>
